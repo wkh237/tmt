@@ -585,20 +585,24 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
     // Group only consecutive drawn indices from the same arranged run. An
     // isolated end of a clipped group retains its full name, never an orphan suffix.
     let labels = |indices: &[usize]| {
+        let group_at = |offset: usize| {
+            let index = indices[offset];
+            prefix(index).filter(|(name, _)| {
+                let adjacent = |other: usize| {
+                    index.abs_diff(other) == 1
+                        && prefix(other).is_some_and(|(other, _)| other == *name)
+                };
+                offset
+                    .checked_sub(1)
+                    .is_some_and(|previous| adjacent(indices[previous]))
+                    || indices.get(offset + 1).is_some_and(|&next| adjacent(next))
+            })
+        };
         indices
             .iter()
             .enumerate()
             .map(|(offset, &index)| {
-                let group = prefix(index).filter(|(name, _)| {
-                    let adjacent = |other: usize| {
-                        index.abs_diff(other) == 1
-                            && prefix(other).is_some_and(|(other, _)| other == *name)
-                    };
-                    offset
-                        .checked_sub(1)
-                        .is_some_and(|previous| adjacent(indices[previous]))
-                        || indices.get(offset + 1).is_some_and(|&next| adjacent(next))
-                });
+                let group = group_at(offset);
                 let header = group
                     .filter(|(name, _)| {
                         offset == 0
@@ -626,7 +630,10 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
                 } else {
                     tab(look, name, selected, attention(index), colors)
                 };
-                (index, header, label)
+                let closes_group =
+                    group.is_some() && offset + 1 < indices.len() && group_at(offset + 1).is_none();
+                let tail = (app.tabs[index] == super::ALL || closes_group).then(|| divider.clone());
+                (index, header, label, tail)
             })
             .collect::<Vec<_>>()
     };
@@ -700,15 +707,11 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
     let cost = |pins: &[usize], start, end| {
         labels(&indices(pins, start, end))
             .iter()
-            .map(|(index, header, label)| {
+            .map(|(_, header, label, tail)| {
                 header.as_ref().map_or(0, |header| header.width())
                     + label.width()
                     + 1
-                    + if app.tabs[*index] == super::ALL {
-                        divider.width()
-                    } else {
-                        0
-                    }
+                    + tail.as_ref().map_or(0, |tail| tail.width())
             })
             .sum::<usize>()
             + hidden_width
@@ -774,7 +777,7 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
     };
     let hidden = right_hidden(&pins, end);
     let reserved = reserve(&pins, end);
-    for (index, header, label) in labels(&visible) {
+    for (index, header, label, tail) in labels(&visible) {
         if index == start && !left.is_empty() {
             used += left.width();
             spans.push(Span::styled(left.clone(), left_style));
@@ -785,14 +788,10 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
         }
         // The current gets the remaining cells in the pathological long-name
         // case; other selected tracks were already admitted by the same cost.
-        let tail = if app.tabs[index] == super::ALL {
-            divider.width()
-        } else {
-            0
-        };
+        let tail_width = tail.as_ref().map_or(0, |tail| tail.width());
         let label_width = label
             .width()
-            .min(width.saturating_sub(used + reserved + tail));
+            .min(width.saturating_sub(used + reserved + tail_width));
         let fitted = fit_tab_label(label, label_width);
         if label_width > 0 {
             app.tab_hits.borrow_mut().push(TabHit {
@@ -807,8 +806,8 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
                 spans.push(Span::raw(" "));
                 used += 1;
             }
-            if tail > 0 {
-                let fitted = fit_tab_label(divider.clone(), tail.min(width.saturating_sub(used)));
+            if let Some(tail) = tail {
+                let fitted = fit_tab_label(tail, tail_width.min(width.saturating_sub(used)));
                 used += fitted.width();
                 spans.extend(fitted.spans);
             }
@@ -4361,7 +4360,7 @@ lines = [
             for (width, expected) in [
                 (
                     160,
-                    " ▚ tmt ◆3 ✗2  │   leads    mamezu  │ tmt · ◆ colab 1  ✗ core 1    infra  ◆ remote 2 ✗1    squad    design    docs  ✗ perf 2    tools  +4 › long-running-squad …",
+                    " ▚ tmt ◆3 ✗2  │   leads    mamezu  │ tmt · ◆ colab 1  ✗ core 1    infra  ◆ remote 2 ✗1    squad    design  │   docs  ✗ perf 2  +5 › tools long-running-squad …",
                 ),
                 (
                     100,
@@ -4483,6 +4482,53 @@ lines = [
         assert!(
             draw(&app, 100, 18).join("\n").contains("tmt-colab"),
             "switcher retains full names"
+        );
+    }
+
+    #[test]
+    fn groups_close_only_before_visible_ungrouped_tabs() {
+        let mut app = tabline_board();
+        app.pinned = 0;
+        app.current = Some("tmt-a".into());
+        app.tabs = ["tmt-a", "tmt-b", "docs", "ops-a", "ops-b", "notes"]
+            .map(String::from)
+            .to_vec();
+        let line = draw(&app, 160, 6)[0].clone();
+        assert_eq!(line.matches('│').count(), 4, "{line}");
+        assert!(line.contains("b  │   docs"), "{line}");
+        assert!(line.contains("b  │   notes"), "{line}");
+        for (column, _) in line
+            .chars()
+            .enumerate()
+            .filter(|(_, symbol)| *symbol == '│')
+        {
+            assert!(
+                app.tab_hits
+                    .borrow()
+                    .iter()
+                    .all(|hit| !(hit.x..hit.x + hit.width).contains(&(column as u16)))
+            );
+        }
+        app.tabs = ["tmt-a", "tmt-b", "ops-a", "ops-b"]
+            .map(String::from)
+            .to_vec();
+        let line = draw(&app, 160, 6)[0].clone();
+        assert_eq!(
+            line.matches('│').count(),
+            2,
+            "groups share a boundary: {line}"
+        );
+        app.tabs.truncate(2);
+        let line = draw(&app, 160, 6)[0].clone();
+        assert_eq!(line.matches('│').count(), 1, "no end divider: {line}");
+        app.tabs = (0..30).map(|index| format!("tmt-squad{index}")).collect();
+        app.current = Some(app.tabs[0].clone());
+        let line = draw(&app, 80, 6)[0].clone();
+        assert!(line.contains(" › "), "{line}");
+        assert_eq!(
+            line.matches('│').count(),
+            1,
+            "no divider before overflow: {line}"
         );
     }
 

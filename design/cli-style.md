@@ -120,9 +120,10 @@ The Squad home tab uses an accent reverse block labelled `▚ tmt`, with separat
 ◆/✗ counts inside; underline indicates the selected home. It reuses `accent`,
 `waiting` and `blocked` at the resolved depth, including `NO_COLOR`. Other tabs
 retain the mark-slot and selection rules above. A shared squad prefix is bold
-accent; its following dot and the separators after home and before groups are dim,
-outside tab selection/hits. Right overflow lists hidden names with their
-attention marks/counts, waiting before blocked before quiet; the counter and
+accent; its following dot and the separators after home, before groups and between
+a group and a following ungrouped tab are dim, outside tab selection/hits. A group
+has no closing separator at line end or before overflow. Right overflow lists
+hidden names with attention marks/counts, waiting before blocked before quiet; the counter and
 final ellipsis are dim. Stored tab order, pin and hide are independent of this
 display grouping.
 
