@@ -592,12 +592,9 @@ pub(super) fn paint(app: &App, area: Rect) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::{
-        app::Effect,
-        view::{
-            render,
-            tests::{board, draw},
-        },
+    use crate::board::view::{
+        render,
+        tests::{board, draw},
     };
     use ratatui::crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,

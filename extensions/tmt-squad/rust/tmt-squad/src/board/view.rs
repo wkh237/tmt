@@ -8,7 +8,6 @@ use super::{
     tab_line::{self, fit_tab_label, tab_label},
 };
 use crate::{
-    attention::Attention,
     config::{BoardMode, NotesRender, Pane, TabColors},
     requests::{BODIES, age},
     rows::Rows,
@@ -24,7 +23,6 @@ use serde_json::Value;
 use tmt_cli_style::{
     Role,
     grid::{Align, Truncate},
-    mark::Mark,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -1525,6 +1523,7 @@ pub(super) mod tests {
     mod meter;
     mod parity;
     use super::*;
+    use crate::attention::Attention;
     use crate::board::app::{Effect, Notes, Snapshot, View};
     use crate::board::tab_line::tab;
     use crate::config::{BoardMode, Direction, Pane};
@@ -1534,6 +1533,7 @@ pub(super) mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use tmt_cli_style::mark::Mark;
     use unicode_width::UnicodeWidthChar;
 
     #[test]
