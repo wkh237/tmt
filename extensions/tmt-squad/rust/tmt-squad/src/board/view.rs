@@ -522,160 +522,318 @@ fn tab(
     label
 }
 
-/// The first header line: only the tabs. Each
-/// tab's place is recorded for clicks and drags. When the tabs do not fit,
-/// the line scrolls to keep the current tab in view, as little as possible
-/// from the last frame, and counts the tabs off each end (`‹ 3`, `5 ›`),
-/// colored by the most pressing state among them.
-fn tab_line(app: &App, area: Rect) -> Line<'_> {
+/// The home keeps its public `all` key; the accent block is presentation only.
+fn home_tab(
+    look: crate::look::Look,
+    selected: bool,
+    attention: Attention,
+    colors: &TabColors,
+) -> Line<'static> {
+    let style = look.role(Role::Accent).add_modifier(
+        Modifier::REVERSED
+            | Modifier::BOLD
+            | if selected {
+                Modifier::UNDERLINED
+            } else {
+                Modifier::empty()
+            },
+    );
+    let mut spans = vec![Span::styled(" ▚ tmt", style)];
+    for (count, mark, color) in [
+        (attention.waiting, Mark::Decision, &colors.waiting),
+        (attention.blocked, Mark::Failed, &colors.blocked),
+    ] {
+        if count > 0 {
+            spans.push(Span::styled(" ", style));
+            spans.push(Span::styled(
+                format!("{}{count}", mark.symbol()),
+                look.named(color)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ));
+        }
+    }
+    spans.push(Span::styled(" ", style));
+    Line::from(spans).style(style)
+}
+
+/// One display owner for grouping, window selection, widths and the hit map.
+/// Keys arrive already arranged; neither fitting nor grouping changes that order.
+fn tab_line(app: &App, area: Rect) -> Line<'static> {
     let look = app.look();
     let default = TabColors::default();
     let colors = app.view.as_ref().map_or(&default, |view| &view.tab_colors);
-    let attention = |key: &String| app.attention.get(key).copied().unwrap_or_default();
-    let labels: Vec<Line> = app
-        .tabs
-        .iter()
-        .map(|key| {
-            let selected = Some(key) == app.current.as_ref();
-            tab(
-                look,
-                super::tabs::label(key),
-                selected,
-                attention(key),
-                colors,
-            )
-        })
-        .collect();
-    let widths: Vec<u16> = labels
-        .iter()
-        .map(|label| label.width() as u16 + 1)
-        .collect();
-    // Pinned tabs always show; the rest scroll in the room they leave.
-    let pinned = app.pinned.min(app.tabs.len());
-    let room = area
-        .width
-        .saturating_sub(widths[..pinned].iter().sum::<u16>());
+    let attention = |index: usize| {
+        app.attention
+            .get(&app.tabs[index])
+            .copied()
+            .unwrap_or_default()
+    };
     let position = app
         .current
         .as_ref()
-        .and_then(|current| app.tabs.iter().position(|key| key == current));
-    // A hidden squad opened by name or from the switcher is not on the line;
-    // it leads it, selected and marked, so the board says what it shows.
-    let shown_hidden = match (&app.current, position) {
-        (Some(key), None) => {
-            let label = format!("{} (hidden)", super::tabs::label(key));
-            Some(tab(look, &label, true, attention(key), colors))
-        }
-        _ => None,
+        .and_then(|key| app.tabs.iter().position(|tab| tab == key));
+    let pinned = app.pinned.min(app.tabs.len());
+    let width = usize::from(area.width);
+    let prefix = |index: usize| {
+        let key = &app.tabs[index];
+        (!super::tabs::aggregate(key))
+            .then(|| key.split_once('-'))
+            .flatten()
+            .filter(|(prefix, suffix)| !prefix.is_empty() && !suffix.is_empty())
     };
-    let reserved = shown_hidden
-        .as_ref()
-        .map_or(0, |label| label.width() as u16 + 1);
-    let room = room.saturating_sub(reserved);
-    let current = position.and_then(|index| index.checked_sub(pinned));
-    let (start, end) = tab_window(&widths[pinned..], current, app.tab_start.get(), room);
-    app.tab_start.set(start);
-    let (start, end) = (start + pinned, end + pinned);
-    let off = |keys: &[String]| {
-        let sum = keys
+    // Group only consecutive drawn indices from the same arranged run. An
+    // isolated end of a clipped group retains its full name, never an orphan suffix.
+    let labels = |indices: &[usize]| {
+        indices
             .iter()
-            .map(attention)
-            .fold(Attention::default(), |sum, one| Attention {
-                waiting: sum.waiting + one.waiting,
-                blocked: sum.blocked + one.blocked,
-            });
-        match sum.state() {
-            "waiting" => look.named(&colors.waiting),
-            "blocked" => look.named(&colors.blocked),
-            _ => look.role(Role::Dim),
-        }
+            .enumerate()
+            .map(|(offset, &index)| {
+                let group = prefix(index).filter(|(name, _)| {
+                    let adjacent = |other: usize| {
+                        index.abs_diff(other) == 1
+                            && prefix(other).is_some_and(|(other, _)| other == *name)
+                    };
+                    offset
+                        .checked_sub(1)
+                        .is_some_and(|previous| adjacent(indices[previous]))
+                        || indices.get(offset + 1).is_some_and(|&next| adjacent(next))
+                });
+                let header = group
+                    .filter(|(name, _)| {
+                        offset == 0
+                            || indices[offset - 1] + 1 != index
+                            || prefix(indices[offset - 1])
+                                .is_none_or(|(previous, _)| previous != *name)
+                    })
+                    .map(|(name, _)| format!("{} · ", tmt_cli_style::table::escape(name)));
+                let name = group.map_or_else(
+                    || super::tabs::label(&app.tabs[index]),
+                    |(_, suffix)| suffix,
+                );
+                let selected = position == Some(index);
+                let label = if app.tabs[index] == super::ALL {
+                    home_tab(look, selected, attention(index), colors)
+                } else {
+                    tab(look, name, selected, attention(index), colors)
+                };
+                (index, header, label)
+            })
+            .collect::<Vec<_>>()
     };
-    let mut line = Vec::new();
-    let mut x = area.x;
-    if let Some(span) = shown_hidden {
-        x = x.saturating_add(reserved);
-        line.extend(span.spans);
-        line.push(Span::raw(" "));
-    }
-    let mut labels: Vec<Option<Line>> = labels.into_iter().map(Some).collect();
-    let mut draw = |index: usize, line: &mut Vec<Span<'static>>, x: &mut u16| {
-        app.tab_hits.borrow_mut().push(TabHit {
-            y: area.y,
-            x: *x,
-            width: widths[index] - 1,
-            tab: index,
+    let shown_hidden = app
+        .current
+        .as_ref()
+        .filter(|_| position.is_none())
+        .map(|key| {
+            tab(
+                look,
+                &format!("{} (hidden)", super::tabs::label(key)),
+                true,
+                app.attention.get(key).copied().unwrap_or_default(),
+                colors,
+            )
         });
-        *x = x.saturating_add(widths[index]);
-        line.extend(labels[index].take().expect("each tab is drawn once").spans);
-        line.push(Span::raw(" "));
+    let hidden_width = shown_hidden.as_ref().map_or(0, |label| label.width() + 1);
+    let mut pins: Vec<usize> = (0..pinned).collect();
+    let current = position.filter(|&index| index >= pinned);
+    let mut start = (app.tab_start.get() + pinned).min(app.tabs.len());
+    start = current
+        .map_or(start, |current| start.min(current))
+        .max(pinned);
+    let mut end = current.map_or(start, |current| current + 1);
+    if end == start && start < app.tabs.len() {
+        end += 1;
+    }
+    let indices =
+        |pins: &[usize], start, end| pins.iter().copied().chain(start..end).collect::<Vec<_>>();
+    let right_hidden = |pins: &[usize], end| {
+        (0..pinned)
+            .filter(|index| !pins.contains(index))
+            .chain(end..app.tabs.len())
+            .collect::<Vec<_>>()
     };
-    for index in 0..pinned {
-        draw(index, &mut line, &mut x);
-    }
-    if start > pinned {
-        let text = format!("‹ {} ", start - pinned);
-        x = x.saturating_add(text.width() as u16);
-        line.push(Span::styled(text, off(&app.tabs[pinned..start])));
-    }
-    for index in start..end {
-        draw(index, &mut line, &mut x);
-    }
-    if end < app.tabs.len() {
-        line.push(Span::styled(
-            format!("{} › ", app.tabs.len() - end),
-            off(&app.tabs[end..]),
-        ));
-    }
-    if let Some(started) = app.loading_since
-        && started.elapsed() >= SPINNER_DELAY
-    {
-        let frame = (started.elapsed().as_millis() / 100) as usize % SPINNER.len();
-        line.push(Span::styled(
-            format!("{} loading", SPINNER[frame]),
-            look.role(Role::Dim),
-        ));
-    }
-    Line::from(line)
-}
-
-/// The tabs `[start, end)` that fit in `room` columns with the overflow
-/// counts, keeping `current` in view and starting as near `previous` as it
-/// allows. A tab wider than the whole line still shows, cut at the edge.
-fn tab_window(
-    widths: &[u16],
-    current: Option<usize>,
-    previous: usize,
-    room: u16,
-) -> (usize, usize) {
-    let count = widths.len();
-    if widths
-        .iter()
-        .map(|width| usize::from(*width))
-        .sum::<usize>()
-        <= usize::from(room)
-    {
-        return (0, count);
-    }
-    // Room for one count, whichever end it is on: "‹ N " or "N › ".
-    let counter = count.to_string().len() + 3;
-    let current = current.unwrap_or(0).min(count.saturating_sub(1));
-    let mut start = previous.min(current);
-    loop {
-        let mut used = if start > 0 { counter } else { 0 };
-        let mut end = start;
-        while end < count {
-            let right = if end + 1 < count { counter } else { 0 };
-            if used + usize::from(widths[end]) + right > usize::from(room) && end > start {
-                break;
+    let ranked = |mut hidden: Vec<usize>| {
+        hidden.sort_by_key(|&index| {
+            let state = attention(index);
+            if state.waiting > 0 {
+                0
+            } else if state.blocked > 0 {
+                1
+            } else {
+                2
             }
-            used += usize::from(widths[end]);
+        });
+        hidden
+    };
+    let overflow_name = |index: usize| {
+        let state = attention(index);
+        let mut text = tmt_cli_style::table::escape(super::tabs::label(&app.tabs[index]));
+        for (count, mark) in [
+            (state.waiting, Mark::Decision),
+            (state.blocked, Mark::Failed),
+        ] {
+            if count > 0 {
+                text.push_str(&format!("{}{count}", mark.symbol()));
+            }
+        }
+        text
+    };
+    let reserve = |pins: &[usize], end| {
+        let hidden = right_hidden(pins, end);
+        ranked(hidden.clone()).first().map_or(0, |&first| {
+            // Reserve a readable first name while leaving most cells to tabs.
+            (format!("+{} › ", hidden.len()).width() + overflow_name(first).width() + 2)
+                .min(28)
+                .min(width / 2)
+        })
+    };
+    let cost = |pins: &[usize], start, end| {
+        labels(&indices(pins, start, end))
+            .iter()
+            .map(|(_, header, label)| {
+                header.as_ref().map_or(0, |header| header.width()) + label.width() + 1
+            })
+            .sum::<usize>()
+            + hidden_width
+            + if start > pinned {
+                format!("‹ {} ", start - pinned).width()
+            } else {
+                0
+            }
+            + reserve(pins, end)
+    };
+    // Restore all tabs after widening, rather than retaining a needless scroll.
+    if cost(&pins, pinned, app.tabs.len()) <= width {
+        start = pinned;
+        end = app.tabs.len();
+    } else {
+        // First retain the current window. Only when pins leave insufficient
+        // physical room do they step aside, from the end, keeping stored order.
+        while cost(&pins, start, end) > width {
+            if start < current.unwrap_or(start) {
+                start += 1;
+            } else if current.is_none() && end > start {
+                end = start;
+            } else if let Some(drop) = pins.iter().rposition(|index| Some(*index) != position) {
+                pins.remove(drop);
+            } else {
+                break; // The current label alone is fitted below.
+            }
+        }
+        while end < app.tabs.len() && cost(&pins, start, end + 1) <= width {
             end += 1;
         }
-        if current < end || start >= current {
-            return (start, end.max(start + 1));
-        }
-        start += 1;
     }
+    app.tab_start.set(start - pinned);
+    let visible = indices(&pins, start, end);
+    let mut spans = Vec::new();
+    let mut used = 0;
+    if let Some(label) = shown_hidden {
+        let fitted = fit_tab_label(label, hidden_width.saturating_sub(1).min(width));
+        used += fitted.width();
+        spans.extend(fitted.spans);
+        if used < width {
+            spans.push(Span::raw(" "));
+            used += 1;
+        }
+    }
+    let left = if start > pinned {
+        format!("‹ {} ", start - pinned)
+    } else {
+        String::new()
+    };
+    let state = (pinned..start)
+        .map(attention)
+        .fold(Attention::default(), |sum, one| Attention {
+            waiting: sum.waiting + one.waiting,
+            blocked: sum.blocked + one.blocked,
+        });
+    let left_style = if state.waiting > 0 {
+        look.named(&colors.waiting)
+    } else if state.blocked > 0 {
+        look.named(&colors.blocked)
+    } else {
+        look.role(Role::Dim)
+    };
+    let hidden = right_hidden(&pins, end);
+    let reserved = reserve(&pins, end);
+    for (index, header, label) in labels(&visible) {
+        if index == start && !left.is_empty() {
+            used += left.width();
+            spans.push(Span::styled(left.clone(), left_style));
+        }
+        if let Some(header) = header {
+            used += header.width();
+            spans.push(Span::styled(header, look.role(Role::Muted)));
+        }
+        // The current gets the remaining cells in the pathological long-name
+        // case; other selected tracks were already admitted by the same cost.
+        let label_width = label.width().min(width.saturating_sub(used + reserved));
+        let fitted = fit_tab_label(label, label_width);
+        if label_width > 0 {
+            app.tab_hits.borrow_mut().push(TabHit {
+                y: area.y,
+                x: area.x.saturating_add(used as u16),
+                width: label_width as u16,
+                tab: index,
+            });
+            spans.extend(fitted.spans);
+            used += label_width;
+            if used < width {
+                spans.push(Span::raw(" "));
+                used += 1;
+            }
+        }
+    }
+    if start == end && !left.is_empty() {
+        let fitted = fit(&left, left.width().min(width.saturating_sub(used)));
+        used += fitted.width();
+        spans.push(Span::styled(fitted, left_style));
+    }
+    if !hidden.is_empty() && used < width {
+        let room = width - used;
+        let mut overflow = Line::from(Span::styled(
+            format!("+{} › ", hidden.len()),
+            look.role(Role::Dim),
+        ));
+        for index in ranked(hidden) {
+            let state = attention(index);
+            let full = overflow_name(index);
+            let name = tmt_cli_style::table::escape(super::tabs::label(&app.tabs[index]));
+            let marks = &full[name.len()..];
+            let available = room.saturating_sub(overflow.width() + 2);
+            // Preserve the mark/count suffix when shortening a hidden name.
+            if available <= marks.width() {
+                break;
+            }
+            let fitted = fit(&name, name.width().min(available - marks.width()));
+            let shortened = fitted != name;
+            if shortened && overflow.spans.len() > 1 {
+                break; // Subsequent names step aside whole for a readable list.
+            }
+            overflow
+                .spans
+                .push(Span::styled(fitted, look.role(Role::Muted)));
+            for (count, mark, color) in [
+                (state.waiting, Mark::Decision, &colors.waiting),
+                (state.blocked, Mark::Failed, &colors.blocked),
+            ] {
+                if count > 0 {
+                    overflow.spans.push(Span::styled(
+                        format!("{}{count}", mark.symbol()),
+                        look.named(color).add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            overflow.spans.push(Span::raw(" "));
+            if shortened {
+                break;
+            }
+        }
+        overflow.spans.push(Span::styled("…", look.role(Role::Dim)));
+        spans.extend(fit_tab_label(overflow, room).spans);
+    }
+    Line::from(spans)
 }
 
 /// The second header line: the shown squad's summary or delayed loading indicator.
@@ -4071,25 +4229,10 @@ lines = [
 
     #[test]
     fn many_tabs_scroll_to_keep_the_current_one_and_count_the_rest() {
-        // Every tab is 8 columns with its gap; 40 columns hold four, or three
-        // beside one count.
-        let widths = [8u16; 10];
-        assert_eq!(tab_window(&[8, 8], Some(1), 0, 40), (0, 2), "all fit");
-        assert_eq!(tab_window(&widths, Some(0), 0, 40), (0, 4));
-        assert_eq!(tab_window(&widths, Some(3), 0, 40), (0, 4));
-        // Moving right scrolls only as far as needed, then left keeps it.
-        let (start, end) = tab_window(&widths, Some(4), 0, 40);
-        assert!(start > 0 && (start..end).contains(&4), "{start}..{end}");
-        assert_eq!(tab_window(&widths, Some(4), start, 40), (start, end));
-        assert_eq!(tab_window(&widths, Some(9), start, 40).1, 10);
-        assert_eq!(tab_window(&widths, Some(2), 5, 40).0, 2);
-        // A tab wider than the line still shows.
-        assert_eq!(tab_window(&[80, 8], Some(0), 0, 40), (0, 1));
-
         let names: Vec<String> = (0..9).map(|n| format!("sq{n}")).collect();
         let mut app = board(json!([{"title": null, "rows": []}]));
         app.tabs = names.clone();
-        app.current = Some("sq7".into());
+        app.current = Some("sq4".into());
         app.attention.insert(
             "sq1".into(),
             Attention {
@@ -4112,16 +4255,16 @@ lines = [
             .collect();
         assert!(line.starts_with("‹ "), "{line:?}");
         assert!(
-            line.contains(" sq7 "),
+            line.contains(" sq4 "),
             "the current tab stays in view: {line:?}"
         );
-        assert!(line.trim_end().ends_with("1 ›"), "{line:?}");
+        assert!(line.contains(" ›") && line.contains("sq8◆2"), "{line:?}");
         // The left count hides a blocked tab, the right one a waiting tab.
         assert_eq!(
             buffer[(0, 0)].fg,
             app.look().role(Role::Blocked).fg.unwrap()
         );
-        let right = line.trim_end().chars().count() as u16 - 1;
+        let right = line[..line.find("◆2").unwrap()].chars().count() as u16;
         assert_eq!(
             buffer[(right, 0)].fg,
             app.look().role(Role::Waiting).fg.unwrap()
@@ -4129,9 +4272,295 @@ lines = [
         // Only shown tabs can be clicked, at their drawn places.
         let hits = app.tab_hits.borrow().clone();
         assert!(hits.iter().all(|hit| hit.tab >= app.tab_start.get()));
-        let seven = hits.iter().find(|hit| hit.tab == 7).unwrap();
-        let at = line[..line.find("  sq7").unwrap()].chars().count() as u16;
-        assert_eq!(seven.x, at);
+        let current = hits.iter().find(|hit| hit.tab == 4).unwrap();
+        let at = line[..line.find("  sq4").unwrap()].chars().count() as u16;
+        assert_eq!(current.x, at);
+    }
+
+    fn tabline_board() -> App {
+        let mut app = board(json!([{"title": null, "rows": []}]));
+        app.tabs = [
+            super::super::ALL,
+            super::super::LEADS,
+            "mamezu",
+            "tmt-colab",
+            "tmt-core",
+            "tmt-infra",
+            "tmt-remote",
+            "tmt-squad",
+            "tmt-design",
+            "docs",
+            "perf",
+            "tools",
+            "long-running-squad",
+            "quiet",
+            "ops",
+            "test",
+        ]
+        .map(String::from)
+        .to_vec();
+        app.current = Some(super::super::ALL.into());
+        app.pinned = 1;
+        for (name, waiting, blocked) in [
+            (super::super::ALL, 3, 2),
+            ("tmt-colab", 1, 0),
+            ("tmt-core", 0, 1),
+            ("tmt-remote", 2, 1),
+            ("perf", 0, 2),
+        ] {
+            app.attention
+                .insert(name.into(), Attention { waiting, blocked });
+        }
+        app
+    }
+
+    #[test]
+    fn home_tabline_snapshots_at_160_100_80_in_dark_light_and_no_color() {
+        for (base, depth) in [
+            (tmt_cli_style::Base::Tmt, tmt_cli_style::Depth::TrueColor),
+            (
+                tmt_cli_style::Base::TmtLight,
+                tmt_cli_style::Depth::TrueColor,
+            ),
+            (tmt_cli_style::Base::Tmt, tmt_cli_style::Depth::None),
+        ] {
+            let mut app = tabline_board();
+            app.view.as_mut().unwrap().look = crate::look::Look {
+                theme: tmt_cli_style::Theme::new(base),
+                depth,
+            };
+            for (width, expected) in [
+                (
+                    160,
+                    " ▚ tmt ◆3 ✗2    leads    mamezu  tmt · ◆ colab 1  ✗ core 1    infra  ◆ remote 2 ✗1    squad    design    docs  ✗ perf 2    tools  +4 › long-running-squad …",
+                ),
+                (
+                    100,
+                    " ▚ tmt ◆3 ✗2    leads    mamezu  tmt · ◆ colab 1  ✗ core 1    infra  ◆ remote 2 ✗1  +9 › perf✗2 …",
+                ),
+                (
+                    80,
+                    " ▚ tmt ◆3 ✗2    leads    mamezu  ◆ tmt-colab 1  +12 › tmt-remote◆2✗1 …",
+                ),
+            ] {
+                let line = draw(&app, width, 6)[0].clone();
+                assert_eq!(line, expected, "{base:?} {depth:?} {width}");
+                let hits = app.tab_hits.borrow().clone();
+                assert_eq!(hits[0].tab, 0);
+                assert!(hits.iter().all(|hit| hit.x + hit.width <= width));
+                let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                assert!(
+                    buffer[(1, 0)]
+                        .modifier
+                        .contains(Modifier::REVERSED | Modifier::UNDERLINED)
+                );
+                assert_eq!(
+                    buffer[(1, 0)].fg,
+                    app.look().role(Role::Accent).fg.unwrap_or_default()
+                );
+                // Counts stay inside the block and use existing attention roles.
+                for (symbol, role) in [("◆", Role::Waiting), ("✗", Role::Blocked)] {
+                    let column = line[..line.find(symbol).unwrap()].chars().count() as u16;
+                    assert_eq!(
+                        buffer[(column, 0)].fg,
+                        app.look().role(role).fg.unwrap_or_default()
+                    );
+                    assert!(buffer[(column, 0)].modifier.contains(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_squads_have_individual_marks_hits_and_full_navigation_keys() {
+        let mut app = tabline_board();
+        app.tabs.truncate(8);
+        let original = app.tabs.clone();
+        let line = draw(&app, 160, 6)[0].clone();
+        assert_eq!(line.matches("tmt ·").count(), 1, "{line}");
+        for (index, name, mark) in [
+            (3, "colab", "◆"),
+            (4, "core", "✗"),
+            (5, "infra", " "),
+            (6, "remote", "◆"),
+        ] {
+            let hit = app
+                .tab_hits
+                .borrow()
+                .iter()
+                .find(|hit| hit.tab == index)
+                .copied()
+                .unwrap();
+            let tab_text: String = line
+                .chars()
+                .skip(usize::from(hit.x))
+                .take(usize::from(hit.width))
+                .collect();
+            assert!(tab_text.starts_with(mark), "{tab_text}");
+            assert!(tab_text.contains(name), "{tab_text}");
+            assert_eq!(
+                app.mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: hit.x,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE
+                    },
+                    std::time::Instant::now()
+                ),
+                super::super::app::Effect::Load(original[index].clone())
+            );
+        }
+        let prefix = line[..line.find("tmt ·").unwrap()].chars().count() as u16;
+        assert!(
+            app.tab_hits
+                .borrow()
+                .iter()
+                .all(|hit| !(hit.x..hit.x + hit.width).contains(&prefix))
+        );
+        assert_eq!(app.tabs, original, "grouping and clicks do not reorder");
+        app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(
+            draw(&app, 100, 18).join("\n").contains("tmt-colab"),
+            "switcher retains full names"
+        );
+    }
+
+    #[test]
+    fn aggregate_tabs_and_interrupted_or_single_prefixes_never_group() {
+        let mut app = tabline_board();
+        app.pinned = 0;
+        app.tabs = [
+            "tmt-a",
+            super::super::ALL,
+            "tmt-b",
+            "@tab:tmt-view",
+            "tmt-c",
+            "other-d",
+            "tmt-e",
+            "tmt-f",
+        ]
+        .map(String::from)
+        .to_vec();
+        let line = draw(&app, 160, 6)[0].clone();
+        for name in ["tmt-a", "tmt-b", "tmt-view", "tmt-c", "other-d"] {
+            assert!(line.contains(name), "{line}");
+        }
+        assert_eq!(line.matches("tmt ·").count(), 1, "{line}");
+        assert_eq!(app.tab_hits.borrow().len(), app.tabs.len());
+    }
+
+    #[test]
+    fn every_current_tab_survives_resize_and_excessive_pins_with_bounded_hits() {
+        for pinned in [1, 8, 16] {
+            let mut app = tabline_board();
+            app.pinned = pinned;
+            let original = app.tabs.clone();
+            for index in 0..app.tabs.len() {
+                app.current = Some(app.tabs[index].clone());
+                for width in [160, 100, 80, 32, 160] {
+                    let line = draw(&app, width, 6)[0].clone();
+                    let hits = app.tab_hits.borrow();
+                    let current = hits
+                        .iter()
+                        .find(|hit| hit.tab == index)
+                        .unwrap_or_else(|| panic!("{pinned} {index} {width}: {line}"));
+                    assert!(current.width > 2, "the name remains visible: {line}");
+                    assert!(hits.iter().all(|hit| hit.x + hit.width <= width));
+                    assert_eq!(app.tabs, original);
+                    if width == 160 {
+                        assert!(hits.len() > 1, "widening restores tabs");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_current_keeps_left_overflow_when_no_scrolling_tab_fits() {
+        let app = tabline_board();
+        app.tab_start.set(10);
+        let line = draw(&app, 32, 6)[0].clone();
+        assert!(line.contains("▚ tmt"), "{line}");
+        assert!(line.contains("‹ 10"), "{line}");
+        let hits = app.tab_hits.borrow();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].tab, 0);
+        assert!(hits[0].x + hits[0].width <= 32);
+    }
+
+    #[test]
+    fn hidden_current_and_wide_long_labels_have_no_invisible_hit_cells() {
+        let mut app = tabline_board();
+        app.current = Some("hidden-squad".into());
+        app.hidden = vec!["hidden-squad".into()];
+        app.pinned = app.tabs.len();
+        let line = draw(&app, 32, 6)[0].clone();
+        assert!(line.starts_with("  hidden-squad (hidden)"), "{line}");
+        assert!(
+            app.tab_hits.borrow().is_empty(),
+            "hidden current leaves no room for pins"
+        );
+        app.pinned = 0;
+        app.tabs = ["界界界界界界界界界界界界界界界界界界界界", "next"]
+            .map(String::from)
+            .to_vec();
+        app.current = Some(app.tabs[0].clone());
+        let line = tab_line(&app, Rect::new(4, 3, 32, 1));
+        assert!(line.width() <= 32, "{line}");
+        let hit = *app.tab_hits.borrow().last().unwrap();
+        assert_eq!((hit.x, hit.y, hit.tab), (4, 3, 0));
+        assert!(hit.width <= 32);
+        assert!(line.to_string().contains('…'));
+    }
+
+    #[test]
+    fn overflow_prioritizes_waiting_then_blocked_then_quiet_without_changing_order() {
+        let mut app = tabline_board();
+        app.tabs = [
+            "current",
+            "this-name-is-far-too-long-to-show-in-the-visible-window-at-any-of-the-expected-capture-widths",
+            "quiet",
+            "blocked",
+            "waiting",
+            "other-waiting",
+        ]
+        .map(String::from)
+        .to_vec();
+        app.pinned = 0;
+        app.current = Some("current".into());
+        app.attention.insert(
+            "waiting".into(),
+            Attention {
+                waiting: 2,
+                blocked: 1,
+            },
+        );
+        app.attention.insert(
+            "other-waiting".into(),
+            Attention {
+                waiting: 1,
+                blocked: 0,
+            },
+        );
+        app.attention.insert(
+            "blocked".into(),
+            Attention {
+                waiting: 0,
+                blocked: 3,
+            },
+        );
+        let original = app.tabs.clone();
+        let line = draw(&app, 80, 6)[0].clone();
+        assert!(
+            line.contains("+5 › waiting◆2✗1 other-waiting◆1 blocked✗3"),
+            "{line}"
+        );
+        assert!(line.ends_with('…'), "{line}");
+        assert_eq!(app.tabs, original);
+        assert_eq!(app.tab_hits.borrow().len(), 1, "overflow has no tab hits");
     }
 
     #[test]
@@ -4164,7 +4593,10 @@ lines = [
             buffer[(19, 0)].fg,
             app.look().role(Role::Blocked).fg.unwrap()
         );
-        assert!(line.trim_end().ends_with(" ›"), "{line:?}");
+        assert!(
+            line.contains(" › ") && line.trim_end().ends_with("…"),
+            "{line:?}"
+        );
         // It is not one of the tabs, so it cannot be clicked or dragged, and
         // the tabs after it are hit where they are drawn.
         let hits = app.tab_hits.borrow().clone();
@@ -4238,11 +4670,11 @@ lines = [
         app.current = Some("sq8".into());
         let line = draw(&app, 36, 6)[0].clone();
         assert!(
-            line.starts_with("  all  ‹ 6 "),
+            line.starts_with(" ▚ tmt  ‹ "),
             "the pin stays first: {line:?}"
         );
         assert!(
-            line.ends_with(" sq8"),
+            line.contains(" sq8"),
             "the current tab is in view: {line:?}"
         );
         let hits = app.tab_hits.borrow().clone();
@@ -4286,7 +4718,7 @@ lines = [
         }
         assert_eq!(app.current.as_deref(), Some("reviews"));
         // Selection is a style, so the tab text is the same either way.
-        assert!(during[0].starts_with("  product    reviews "), "{during:?}");
+        assert_eq!(before[0], during[0], "selection never changes label width");
         assert_eq!(before[0].trim_end(), "  product    reviews");
         assert!(
             during[1].contains("loading"),

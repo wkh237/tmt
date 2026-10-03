@@ -3671,11 +3671,24 @@ and list/lifecycle owners stay outside paint, with shared hunks coordinated.
 Moving a tab (Shift+←/→, or a drag on the tab
 line) saves `[tabs] order` through `Config::write`, the same compare-and-set,
 format-preserving replacement that records `me`. A tab line that doesn't
-fit scrolls: `tab_window` keeps the current tab in view, starting as near the
-last frame's first tab as it can. It counts the hidden tabs at each end, and
-only the drawn tabs can be clicked. Pinned tabs (`[tabs] pin`) come first from
-`tabs::arrange` in `pin`'s order and are drawn before the scrolled window. A
-move never moves or passes a pin, since the saved `order` could not reorder
+fit scrolls: `board::view::tab_line` owns grouping, window selection, rendered
+cell widths and tab hit geometry together. After `tabs::arrange`, it groups only
+adjacent squad keys sharing a nonempty prefix before the first `-`, with two or
+more drawn tabs; aggregate keys interrupt a group. Prefix spans have no hit;
+each suffix retains its own fixed mark slot and original key/index for clicks,
+drags and switching. An isolated drawn group member retains its full name.
+Left overflow counts skipped tabs; right overflow names remaining tabs, ordered
+waiting, blocked, quiet, with arrangement order retained within each tier.
+Names use full labels unless the visible prefix makes a suffix unambiguous.
+Only visible label cells have hits. Current-first fitting keeps the current
+label visible even when pins exceed the width, allowing other pins to step aside
+from the end without changing stored order. Pinned tabs otherwise precede the
+scrolled window in `tabs::arrange`'s order. `Config::tabs` defaults to pinned
+home (`@all`) then leads only when neither order nor pin is configured; explicit
+empty arrays count as configured, and hide remains authoritative. The home
+renders as an accent `▚ tmt` block with both attention counts inside, using
+existing roles and a reverse fallback; its public/config keys remain unchanged.
+A move never moves or passes a pin, since the saved `order` could not reorder
 them. The switcher (`s`, unless the user bound
 it) filters the tab line's tabs and the hidden ones with `tabs::matching`: a
 prefix match first, then a substring, then the letters in order. A shown
