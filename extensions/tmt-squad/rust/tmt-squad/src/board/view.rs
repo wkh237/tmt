@@ -2,12 +2,12 @@
 //! cells so wide characters never misalign columns.
 
 use super::{
-    app::{App, Hit, Item, Notes, Switcher, TabHit, TitleHit},
+    app::{App, Hit, Item, Notes, Switcher, TitleHit},
     markdown,
     notes::{sanitize, wrap},
+    tab_line::{self, fit_tab_label, tab_label},
 };
 use crate::{
-    attention::Attention,
     config::{BoardMode, NotesRender, Pane, TabColors},
     requests::{BODIES, age},
     rows::Rows,
@@ -23,7 +23,6 @@ use serde_json::Value;
 use tmt_cli_style::{
     Role,
     grid::{Align, Truncate},
-    mark::Mark,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -412,272 +411,6 @@ fn pane_tab(look: crate::look::Look, name: &str, selected: bool) -> Span<'static
     }
 }
 
-/// A tab or switcher entry has one fixed mark slot and one styled label owner.
-fn tab_label(
-    look: crate::look::Look,
-    name: &str,
-    attention: Attention,
-    colors: &TabColors,
-    style: Style,
-) -> Line<'static> {
-    let attention_style = |color: &str| {
-        let foreground = look.named(color);
-        Style {
-            // Explicit default foreground prevents the label's accent/muted
-            // foreground leaking into a mark whose configured color is default.
-            fg: Some(foreground.fg.unwrap_or_default()),
-            bg: style.bg,
-            ..foreground
-                .add_modifier(Modifier::BOLD | (style.add_modifier & Modifier::REVERSED))
-                .remove_modifier(
-                    style.add_modifier
-                        & !(foreground.add_modifier | Modifier::BOLD | Modifier::REVERSED),
-                )
-        }
-    };
-    let (mark, count, color) = if attention.waiting > 0 {
-        (Mark::Decision.symbol(), attention.waiting, &colors.waiting)
-    } else if attention.blocked > 0 {
-        (Mark::Failed.symbol(), attention.blocked, &colors.blocked)
-    } else {
-        (" ", 0, &colors.waiting)
-    };
-    let mut spans = vec![
-        Span::styled(
-            mark,
-            if count > 0 {
-                attention_style(color)
-            } else {
-                style
-            },
-        ),
-        Span::styled(format!(" {}", tmt_cli_style::table::escape(name)), style),
-    ];
-    if count > 0 {
-        spans.push(Span::styled(format!(" {count}"), style));
-    }
-    if attention.waiting > 0 && attention.blocked > 0 {
-        spans.push(Span::styled(" ", style));
-        spans.push(Span::styled(
-            format!("{}{}", Mark::Failed.symbol(), attention.blocked),
-            attention_style(&colors.blocked),
-        ));
-    }
-    Line::from(spans).style(style)
-}
-
-/// Fit the shared label through the grid owner, preserving the styles of the
-/// retained prefix. Widths elsewhere come from this same rendered Line::width.
-fn fit_tab_label(mut line: Line<'static>, width: usize) -> Line<'static> {
-    if line.width() <= width {
-        line.spans
-            .push(Span::styled(" ".repeat(width - line.width()), line.style));
-        return line;
-    }
-    let text = line.to_string();
-    let fitted = fit(&text, width);
-    let mut retained: usize = text
-        .chars()
-        .zip(fitted.chars())
-        .take_while(|(original, shown)| original == shown)
-        .map(|(original, _)| original.len_utf8())
-        .sum();
-    let prefix = retained;
-    let mut spans = Vec::new();
-    for span in line.spans {
-        let kept = retained.min(span.content.len());
-        if kept > 0 {
-            spans.push(Span::styled(span.content[..kept].to_owned(), span.style));
-            retained -= kept;
-        }
-        if retained == 0 {
-            break;
-        }
-    }
-    spans.push(Span::styled(fitted[prefix..].to_owned(), line.style));
-    Line::from(spans).style(line.style)
-}
-
-/// Selection covers the entire tab; attention decorates only its marks.
-fn tab(
-    look: crate::look::Look,
-    name: &str,
-    selected: bool,
-    attention: Attention,
-    colors: &TabColors,
-) -> Line<'static> {
-    let style = if selected {
-        let selection = look.selection();
-        Style {
-            bg: selection.bg,
-            ..look
-                .role(Role::Accent)
-                .add_modifier(Modifier::BOLD | selection.add_modifier)
-        }
-    } else {
-        look.role(Role::Muted)
-    };
-    let mut label = tab_label(look, name, attention, colors, style);
-    label.spans.push(Span::styled(" ", style));
-    label
-}
-
-/// The first header line: only the tabs. Each
-/// tab's place is recorded for clicks and drags. When the tabs do not fit,
-/// the line scrolls to keep the current tab in view, as little as possible
-/// from the last frame, and counts the tabs off each end (`‹ 3`, `5 ›`),
-/// colored by the most pressing state among them.
-fn tab_line(app: &App, area: Rect) -> Line<'_> {
-    let look = app.look();
-    let default = TabColors::default();
-    let colors = app.view.as_ref().map_or(&default, |view| &view.tab_colors);
-    let attention = |key: &String| app.attention.get(key).copied().unwrap_or_default();
-    let labels: Vec<Line> = app
-        .tabs
-        .iter()
-        .map(|key| {
-            let selected = Some(key) == app.current.as_ref();
-            tab(
-                look,
-                super::tabs::label(key),
-                selected,
-                attention(key),
-                colors,
-            )
-        })
-        .collect();
-    let widths: Vec<u16> = labels
-        .iter()
-        .map(|label| label.width() as u16 + 1)
-        .collect();
-    // Pinned tabs always show; the rest scroll in the room they leave.
-    let pinned = app.pinned.min(app.tabs.len());
-    let room = area
-        .width
-        .saturating_sub(widths[..pinned].iter().sum::<u16>());
-    let position = app
-        .current
-        .as_ref()
-        .and_then(|current| app.tabs.iter().position(|key| key == current));
-    // A hidden squad opened by name or from the switcher is not on the line;
-    // it leads it, selected and marked, so the board says what it shows.
-    let shown_hidden = match (&app.current, position) {
-        (Some(key), None) => {
-            let label = format!("{} (hidden)", super::tabs::label(key));
-            Some(tab(look, &label, true, attention(key), colors))
-        }
-        _ => None,
-    };
-    let reserved = shown_hidden
-        .as_ref()
-        .map_or(0, |label| label.width() as u16 + 1);
-    let room = room.saturating_sub(reserved);
-    let current = position.and_then(|index| index.checked_sub(pinned));
-    let (start, end) = tab_window(&widths[pinned..], current, app.tab_start.get(), room);
-    app.tab_start.set(start);
-    let (start, end) = (start + pinned, end + pinned);
-    let off = |keys: &[String]| {
-        let sum = keys
-            .iter()
-            .map(attention)
-            .fold(Attention::default(), |sum, one| Attention {
-                waiting: sum.waiting + one.waiting,
-                blocked: sum.blocked + one.blocked,
-            });
-        match sum.state() {
-            "waiting" => look.named(&colors.waiting),
-            "blocked" => look.named(&colors.blocked),
-            _ => look.role(Role::Dim),
-        }
-    };
-    let mut line = Vec::new();
-    let mut x = area.x;
-    if let Some(span) = shown_hidden {
-        x = x.saturating_add(reserved);
-        line.extend(span.spans);
-        line.push(Span::raw(" "));
-    }
-    let mut labels: Vec<Option<Line>> = labels.into_iter().map(Some).collect();
-    let mut draw = |index: usize, line: &mut Vec<Span<'static>>, x: &mut u16| {
-        app.tab_hits.borrow_mut().push(TabHit {
-            y: area.y,
-            x: *x,
-            width: widths[index] - 1,
-            tab: index,
-        });
-        *x = x.saturating_add(widths[index]);
-        line.extend(labels[index].take().expect("each tab is drawn once").spans);
-        line.push(Span::raw(" "));
-    };
-    for index in 0..pinned {
-        draw(index, &mut line, &mut x);
-    }
-    if start > pinned {
-        let text = format!("‹ {} ", start - pinned);
-        x = x.saturating_add(text.width() as u16);
-        line.push(Span::styled(text, off(&app.tabs[pinned..start])));
-    }
-    for index in start..end {
-        draw(index, &mut line, &mut x);
-    }
-    if end < app.tabs.len() {
-        line.push(Span::styled(
-            format!("{} › ", app.tabs.len() - end),
-            off(&app.tabs[end..]),
-        ));
-    }
-    if let Some(started) = app.loading_since
-        && started.elapsed() >= SPINNER_DELAY
-    {
-        let frame = (started.elapsed().as_millis() / 100) as usize % SPINNER.len();
-        line.push(Span::styled(
-            format!("{} loading", SPINNER[frame]),
-            look.role(Role::Dim),
-        ));
-    }
-    Line::from(line)
-}
-
-/// The tabs `[start, end)` that fit in `room` columns with the overflow
-/// counts, keeping `current` in view and starting as near `previous` as it
-/// allows. A tab wider than the whole line still shows, cut at the edge.
-fn tab_window(
-    widths: &[u16],
-    current: Option<usize>,
-    previous: usize,
-    room: u16,
-) -> (usize, usize) {
-    let count = widths.len();
-    if widths
-        .iter()
-        .map(|width| usize::from(*width))
-        .sum::<usize>()
-        <= usize::from(room)
-    {
-        return (0, count);
-    }
-    // Room for one count, whichever end it is on: "‹ N " or "N › ".
-    let counter = count.to_string().len() + 3;
-    let current = current.unwrap_or(0).min(count.saturating_sub(1));
-    let mut start = previous.min(current);
-    loop {
-        let mut used = if start > 0 { counter } else { 0 };
-        let mut end = start;
-        while end < count {
-            let right = if end + 1 < count { counter } else { 0 };
-            if used + usize::from(widths[end]) + right > usize::from(room) && end > start {
-                break;
-            }
-            used += usize::from(widths[end]);
-            end += 1;
-        }
-        if current < end || start >= current {
-            return (start, end.max(start + 1));
-        }
-        start += 1;
-    }
-}
-
 /// The second header line: the shown squad's summary or delayed loading indicator.
 fn summary_line(app: &App) -> Line<'_> {
     let look = app.look();
@@ -819,7 +552,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    frame.render_widget(Paragraph::new(tab_line(app, tabs)), tabs);
+    frame.render_widget(Paragraph::new(tab_line::paint(app, tabs)), tabs);
     let summary_text = app
         .view
         .as_ref()
@@ -830,6 +563,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             |home| super::home::summary(home, summary.width, look),
         );
     frame.render_widget(Paragraph::new(summary_text), summary);
+
     render_meter(frame, app, summary);
     render_body(frame, app, body);
     let mut footer_line = if let Some(input) = &app.input {
@@ -1785,11 +1519,13 @@ fn render_rows(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     mod meter;
     mod parity;
     use super::*;
+    use crate::attention::Attention;
     use crate::board::app::{Effect, Notes, Snapshot, View};
+    use crate::board::tab_line::tab;
     use crate::config::{BoardMode, Direction, Pane};
     use ratatui::crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1797,6 +1533,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use tmt_cli_style::mark::Mark;
     use unicode_width::UnicodeWidthChar;
 
     #[test]
@@ -1830,7 +1567,7 @@ mod tests {
         )
     }
 
-    fn draw(app: &App, width: u16, height: u16) -> Vec<String> {
+    pub(crate) fn draw(app: &App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render(frame, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1852,7 +1589,7 @@ mod tests {
             .collect()
     }
 
-    fn board(sections: Value) -> App {
+    pub(crate) fn board(sections: Value) -> App {
         let mut app = App::new(Some("product".into()));
         app.apply(Snapshot {
             tabs: vec!["product".into(), "reviews".into()],
@@ -3850,132 +3587,6 @@ lines = [
     }
 
     #[test]
-    fn tab_hits_cover_the_slot_name_and_trailing_cell_of_the_rendered_label() {
-        use crate::board::app::Effect;
-        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        for attention in [
-            Attention::default(),
-            Attention {
-                waiting: 1,
-                blocked: 2,
-            },
-        ] {
-            for offset in [0, 2, 14] {
-                let mut app = board(json!([{"title": null, "rows": []}]));
-                app.attention.insert("reviews".into(), attention);
-                draw(&app, 80, 8);
-                let hit = app.tab_hits.borrow()[1];
-                let label = tab(
-                    app.look(),
-                    "reviews",
-                    false,
-                    attention,
-                    &TabColors::default(),
-                );
-                assert_eq!(usize::from(hit.width), label.width());
-                let x = hit.x + offset.min(hit.width - 1);
-                assert_eq!(
-                    app.mouse(
-                        MouseEvent {
-                            kind: MouseEventKind::Down(MouseButton::Left),
-                            column: x,
-                            row: hit.y,
-                            modifiers: KeyModifiers::NONE,
-                        },
-                        std::time::Instant::now()
-                    ),
-                    Effect::Load("reviews".into())
-                );
-                assert_eq!(app.current.as_deref(), Some("reviews"));
-            }
-        }
-    }
-
-    #[test]
-    fn default_attention_color_does_not_inherit_the_selected_name_foreground() {
-        let look = crate::look::Look::default();
-        let label = tab(
-            look,
-            "product",
-            true,
-            Attention {
-                waiting: 1,
-                blocked: 1,
-            },
-            &TabColors {
-                waiting: "default".into(),
-                blocked: "default".into(),
-            },
-        );
-        for rendered in [label.clone(), Line::from(label.spans)] {
-            let width = rendered.width() as u16;
-            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
-            terminal
-                .draw(|frame| frame.render_widget(Paragraph::new(rendered), frame.area()))
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            assert_eq!(buffer[(0, 0)].fg, Style::new().fg.unwrap_or_default());
-            assert_eq!(buffer[(12, 0)].fg, Style::new().fg.unwrap_or_default());
-            assert_eq!(buffer[(2, 0)].fg, look.role(Role::Accent).fg.unwrap());
-            for x in 0..width {
-                assert_eq!(buffer[(x, 0)].bg, look.selection().bg.unwrap());
-            }
-        }
-    }
-
-    #[test]
-    fn switcher_fitting_keeps_mark_styles_alignment_and_its_selected_row() {
-        let look = crate::look::Look::default();
-        let style = Style::new().add_modifier(Modifier::REVERSED);
-        let colors = TabColors {
-            waiting: "review".into(),
-            blocked: "link".into(),
-        };
-        for name in ["product", "wide-界界界界界界", "literal…name"] {
-            let label = tab_label(
-                look,
-                name,
-                Attention {
-                    waiting: 1,
-                    blocked: 2,
-                },
-                &colors,
-                style,
-            );
-            for width in [0, 1, 2, 8, 12, 40] {
-                let fitted = fit_tab_label(label.clone(), width);
-                assert_eq!(fitted.width(), width);
-                assert_eq!(fitted.to_string(), fit(&label.to_string(), width));
-                if width == 0 {
-                    continue;
-                }
-                let mut terminal = Terminal::new(TestBackend::new(width as u16, 1)).unwrap();
-                terminal
-                    .draw(|frame| frame.render_widget(Paragraph::new(fitted), frame.area()))
-                    .unwrap();
-                let buffer = terminal.backend().buffer();
-                let mut x = 0;
-                while x < width as u16 {
-                    let cell = &buffer[(x, 0)];
-                    assert!(cell.modifier.contains(Modifier::REVERSED));
-                    // The next cell of a wide glyph is a backend placeholder.
-                    x += cell.symbol().width().max(1) as u16;
-                }
-                if width > 1 {
-                    assert_eq!(buffer[(0, 0)].symbol(), Mark::Decision.symbol());
-                    assert_eq!(buffer[(0, 0)].fg, look.role(Role::Review).fg.unwrap());
-                }
-                if width == 40 {
-                    assert_eq!(buffer[(2, 0)].symbol(), &name[..1]);
-                    let blocked = label.width() as u16 - 2;
-                    assert_eq!(buffer[(blocked, 0)].symbol(), Mark::Failed.symbol());
-                    assert_eq!(buffer[(blocked, 0)].fg, look.role(Role::Link).fg.unwrap());
-                }
-            }
-        }
-    }
-
-    #[test]
     fn the_leads_tab_is_labelled_leads_and_counts_squad_leads() {
         let mut view = board(json!([{"title": null, "rows": [
             row("sol", "working", "plan", json!({"fields": {"squad": "product", "state": "working", "task": "plan"}})),
@@ -4070,111 +3681,6 @@ lines = [
     }
 
     #[test]
-    fn many_tabs_scroll_to_keep_the_current_one_and_count_the_rest() {
-        // Every tab is 8 columns with its gap; 40 columns hold four, or three
-        // beside one count.
-        let widths = [8u16; 10];
-        assert_eq!(tab_window(&[8, 8], Some(1), 0, 40), (0, 2), "all fit");
-        assert_eq!(tab_window(&widths, Some(0), 0, 40), (0, 4));
-        assert_eq!(tab_window(&widths, Some(3), 0, 40), (0, 4));
-        // Moving right scrolls only as far as needed, then left keeps it.
-        let (start, end) = tab_window(&widths, Some(4), 0, 40);
-        assert!(start > 0 && (start..end).contains(&4), "{start}..{end}");
-        assert_eq!(tab_window(&widths, Some(4), start, 40), (start, end));
-        assert_eq!(tab_window(&widths, Some(9), start, 40).1, 10);
-        assert_eq!(tab_window(&widths, Some(2), 5, 40).0, 2);
-        // A tab wider than the line still shows.
-        assert_eq!(tab_window(&[80, 8], Some(0), 0, 40), (0, 1));
-
-        let names: Vec<String> = (0..9).map(|n| format!("sq{n}")).collect();
-        let mut app = board(json!([{"title": null, "rows": []}]));
-        app.tabs = names.clone();
-        app.current = Some("sq7".into());
-        app.attention.insert(
-            "sq1".into(),
-            Attention {
-                waiting: 0,
-                blocked: 1,
-            },
-        );
-        app.attention.insert(
-            "sq8".into(),
-            Attention {
-                waiting: 2,
-                blocked: 0,
-            },
-        );
-        let mut terminal = Terminal::new(TestBackend::new(32, 6)).unwrap();
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let line: String = (0..32)
-            .map(|x| buffer[(x, 0)].symbol().to_owned())
-            .collect();
-        assert!(line.starts_with("‹ "), "{line:?}");
-        assert!(
-            line.contains(" sq7 "),
-            "the current tab stays in view: {line:?}"
-        );
-        assert!(line.trim_end().ends_with("1 ›"), "{line:?}");
-        // The left count hides a blocked tab, the right one a waiting tab.
-        assert_eq!(
-            buffer[(0, 0)].fg,
-            app.look().role(Role::Blocked).fg.unwrap()
-        );
-        let right = line.trim_end().chars().count() as u16 - 1;
-        assert_eq!(
-            buffer[(right, 0)].fg,
-            app.look().role(Role::Waiting).fg.unwrap()
-        );
-        // Only shown tabs can be clicked, at their drawn places.
-        let hits = app.tab_hits.borrow().clone();
-        assert!(hits.iter().all(|hit| hit.tab >= app.tab_start.get()));
-        let seven = hits.iter().find(|hit| hit.tab == 7).unwrap();
-        let at = line[..line.find("  sq7").unwrap()].chars().count() as u16;
-        assert_eq!(seven.x, at);
-    }
-
-    #[test]
-    fn a_hidden_squad_being_shown_leads_the_tab_line_selected() {
-        let mut app = board(json!([{"title": null, "rows": []}]));
-        app.tabs = (0..9).map(|n| format!("sq{n}")).collect();
-        app.hidden = vec!["quiet".into()];
-        app.current = Some("quiet".into());
-        app.attention.insert(
-            "quiet".into(),
-            Attention {
-                waiting: 1,
-                blocked: 2,
-            },
-        );
-        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let line: String = (0..40)
-            .map(|x| buffer[(x, 0)].symbol().to_owned())
-            .collect();
-        assert!(line.starts_with("◆ quiet (hidden) 1 ✗2 "), "{line:?}");
-        assert!(buffer[(2, 0)].modifier.contains(Modifier::BOLD));
-        assert_eq!(buffer[(2, 0)].fg, app.look().role(Role::Accent).fg.unwrap());
-        assert_eq!(
-            buffer[(0, 0)].fg,
-            app.look().role(Role::Waiting).fg.unwrap()
-        );
-        assert_eq!(
-            buffer[(19, 0)].fg,
-            app.look().role(Role::Blocked).fg.unwrap()
-        );
-        assert!(line.trim_end().ends_with(" ›"), "{line:?}");
-        // It is not one of the tabs, so it cannot be clicked or dragged, and
-        // the tabs after it are hit where they are drawn.
-        let hits = app.tab_hits.borrow().clone();
-        let first = hits.iter().find(|hit| hit.tab == 0).unwrap();
-        let at = line[..line.find("  sq0").unwrap()].chars().count() as u16;
-        assert_eq!(first.x, at, "{line:?}");
-        assert!(hits.iter().all(|hit| hit.x >= at));
-    }
-
-    #[test]
     fn the_switcher_filters_every_tab_and_opens_the_chosen_one() {
         use crate::board::app::Effect;
         let mut app = board(json!([{"title": null, "rows": []}]));
@@ -4228,46 +3734,6 @@ lines = [
     }
 
     #[test]
-    fn pinned_tabs_stay_in_view_and_keep_their_pin_order() {
-        use crate::board::app::Effect;
-        let mut app = board(json!([{"title": null, "rows": []}]));
-        app.tabs = std::iter::once(crate::board::ALL.to_owned())
-            .chain((0..9).map(|n| format!("sq{n}")))
-            .collect();
-        app.pinned = 1;
-        app.current = Some("sq8".into());
-        let line = draw(&app, 36, 6)[0].clone();
-        assert!(
-            line.starts_with("  all  ‹ 6 "),
-            "the pin stays first: {line:?}"
-        );
-        assert!(
-            line.ends_with(" sq8"),
-            "the current tab is in view: {line:?}"
-        );
-        let hits = app.tab_hits.borrow().clone();
-        assert_eq!(hits[0].tab, 0);
-        assert_eq!(hits[0].x, 0);
-        // A pin neither moves nor is passed; the other tabs move among
-        // themselves. (A saved `order` could not reorder the pins.)
-        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
-        let refused = Some("Pinned tabs keep the order in [tabs] pin.");
-        app.current = Some("sq0".into());
-        assert_eq!(app.key(shift(KeyCode::Left)), Effect::None);
-        assert_eq!(app.notice.as_deref(), refused);
-        app.pinned = 2;
-        app.current = Some(crate::board::ALL.into());
-        app.notice = None;
-        assert_eq!(app.key(shift(KeyCode::Right)), Effect::None);
-        assert_eq!(app.notice.as_deref(), refused);
-        assert_eq!(app.tabs[..2], [crate::board::ALL, "sq0"]);
-        app.pinned = 1;
-        app.current = Some("sq0".into());
-        assert!(matches!(app.key(shift(KeyCode::Right)), Effect::Act(_)));
-        assert_eq!(app.tabs[..3], [crate::board::ALL, "sq1", "sq0"]);
-    }
-
-    #[test]
     fn switching_squads_never_moves_a_tab_or_blanks_the_frame() {
         let mut app = board(json!([
             {"title": null, "rows": [row("auth-fix", "blocked", "rotate", json!({}))]}
@@ -4286,7 +3752,7 @@ lines = [
         }
         assert_eq!(app.current.as_deref(), Some("reviews"));
         // Selection is a style, so the tab text is the same either way.
-        assert!(during[0].starts_with("  product    reviews "), "{during:?}");
+        assert_eq!(before[0], during[0], "selection never changes label width");
         assert_eq!(before[0].trim_end(), "  product    reviews");
         assert!(
             during[1].contains("loading"),

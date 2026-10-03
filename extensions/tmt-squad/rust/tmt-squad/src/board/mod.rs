@@ -14,6 +14,7 @@ mod refresh;
 mod scroll;
 mod settings;
 pub(crate) use crate::tabs;
+mod tab_line;
 mod terminal;
 mod theme_picker;
 mod view;
