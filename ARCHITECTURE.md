@@ -3671,8 +3671,10 @@ and list/lifecycle owners stay outside paint, with shared hunks coordinated.
 Moving a tab (Shift+←/→, or a drag on the tab
 line) saves `[tabs] order` through `Config::write`, the same compare-and-set,
 format-preserving replacement that records `me`. A tab line that doesn't
-fit scrolls: `board::view::tab_line` owns grouping, window selection, rendered
-cell widths and tab hit geometry together. After `tabs::arrange`, it groups only
+fit scrolls: `board::tab_line` owns display after arrangement. Its pure window
+computation admits pins and a contiguous scrolling range from measured
+label/group/overflow widths; its painter applies the same grouping decisions to spans and exact tab
+hit geometry. After `tabs::arrange`, it groups only
 adjacent squad keys sharing a nonempty prefix before the first `-`, with two or
 more drawn tabs; aggregate keys interrupt a group. Prefix and separator spans have no hit;
 each suffix retains its own fixed mark slot and original key/index for clicks,
