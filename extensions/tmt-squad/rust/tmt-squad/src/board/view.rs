@@ -574,6 +574,7 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
         .and_then(|key| app.tabs.iter().position(|tab| tab == key));
     let pinned = app.pinned.min(app.tabs.len());
     let width = usize::from(area.width);
+    let divider = Line::from(Span::styled("│ ", look.role(Role::Dim)));
     let prefix = |index: usize| {
         let key = &app.tabs[index];
         (!super::tabs::aggregate(key))
@@ -605,7 +606,16 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
                             || prefix(indices[offset - 1])
                                 .is_none_or(|(previous, _)| previous != *name)
                     })
-                    .map(|(name, _)| format!("{} · ", tmt_cli_style::table::escape(name)));
+                    .map(|(name, _)| {
+                        Line::from(vec![
+                            Span::styled("│ ", look.role(Role::Dim)),
+                            Span::styled(
+                                tmt_cli_style::table::escape(name),
+                                look.role(Role::Accent).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(" · ", look.role(Role::Dim)),
+                        ])
+                    });
                 let name = group.map_or_else(
                     || super::tabs::label(&app.tabs[index]),
                     |(_, suffix)| suffix,
@@ -690,8 +700,15 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
     let cost = |pins: &[usize], start, end| {
         labels(&indices(pins, start, end))
             .iter()
-            .map(|(_, header, label)| {
-                header.as_ref().map_or(0, |header| header.width()) + label.width() + 1
+            .map(|(index, header, label)| {
+                header.as_ref().map_or(0, |header| header.width())
+                    + label.width()
+                    + 1
+                    + if app.tabs[*index] == super::ALL {
+                        divider.width()
+                    } else {
+                        0
+                    }
             })
             .sum::<usize>()
             + hidden_width
@@ -764,11 +781,18 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
         }
         if let Some(header) = header {
             used += header.width();
-            spans.push(Span::styled(header, look.role(Role::Muted)));
+            spans.extend(header.spans);
         }
         // The current gets the remaining cells in the pathological long-name
         // case; other selected tracks were already admitted by the same cost.
-        let label_width = label.width().min(width.saturating_sub(used + reserved));
+        let tail = if app.tabs[index] == super::ALL {
+            divider.width()
+        } else {
+            0
+        };
+        let label_width = label
+            .width()
+            .min(width.saturating_sub(used + reserved + tail));
         let fitted = fit_tab_label(label, label_width);
         if label_width > 0 {
             app.tab_hits.borrow_mut().push(TabHit {
@@ -782,6 +806,11 @@ fn tab_line(app: &App, area: Rect) -> Line<'static> {
             if used < width {
                 spans.push(Span::raw(" "));
                 used += 1;
+            }
+            if tail > 0 {
+                let fitted = fit_tab_label(divider.clone(), tail.min(width.saturating_sub(used)));
+                used += fitted.width();
+                spans.extend(fitted.spans);
             }
         }
     }
@@ -4332,15 +4361,15 @@ lines = [
             for (width, expected) in [
                 (
                     160,
-                    " ▚ tmt ◆3 ✗2    leads    mamezu  tmt · ◆ colab 1  ✗ core 1    infra  ◆ remote 2 ✗1    squad    design    docs  ✗ perf 2    tools  +4 › long-running-squad …",
+                    " ▚ tmt ◆3 ✗2  │   leads    mamezu  │ tmt · ◆ colab 1  ✗ core 1    infra  ◆ remote 2 ✗1    squad    design    docs  ✗ perf 2    tools  +4 › long-running-squad …",
                 ),
                 (
                     100,
-                    " ▚ tmt ◆3 ✗2    leads    mamezu  tmt · ◆ colab 1  ✗ core 1    infra  ◆ remote 2 ✗1  +9 › perf✗2 …",
+                    " ▚ tmt ◆3 ✗2  │   leads    mamezu  │ tmt · ◆ colab 1  ✗ core 1    infra  +10 › tmt-remote◆2✗1 …",
                 ),
                 (
                     80,
-                    " ▚ tmt ◆3 ✗2    leads    mamezu  ◆ tmt-colab 1  +12 › tmt-remote◆2✗1 …",
+                    " ▚ tmt ◆3 ✗2  │   leads    mamezu  ◆ tmt-colab 1  +12 › tmt-remote◆2✗1 …",
                 ),
             ] {
                 let line = draw(&app, width, 6)[0].clone();
@@ -4380,6 +4409,7 @@ lines = [
         let original = app.tabs.clone();
         let line = draw(&app, 160, 6)[0].clone();
         assert_eq!(line.matches("tmt ·").count(), 1, "{line}");
+        assert_eq!(line.matches('│').count(), 2, "{line}");
         for (index, name, mark) in [
             (3, "colab", "◆"),
             (4, "core", "✗"),
@@ -4414,6 +4444,34 @@ lines = [
             );
         }
         let prefix = line[..line.find("tmt ·").unwrap()].chars().count() as u16;
+        let mut terminal = Terminal::new(TestBackend::new(160, 6)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(prefix, 0)].fg,
+            app.look().role(Role::Accent).fg.unwrap()
+        );
+        assert!(buffer[(prefix, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            buffer[(prefix + 3, 0)].fg,
+            app.look().role(Role::Dim).fg.unwrap()
+        );
+        for (column, _) in line
+            .chars()
+            .enumerate()
+            .filter(|(_, symbol)| *symbol == '│')
+        {
+            assert_eq!(
+                buffer[(column as u16, 0)].fg,
+                app.look().role(Role::Dim).fg.unwrap()
+            );
+            assert!(
+                app.tab_hits
+                    .borrow()
+                    .iter()
+                    .all(|hit| !(hit.x..hit.x + hit.width).contains(&(column as u16)))
+            );
+        }
         assert!(
             app.tab_hits
                 .borrow()
@@ -4670,7 +4728,7 @@ lines = [
         app.current = Some("sq8".into());
         let line = draw(&app, 36, 6)[0].clone();
         assert!(
-            line.starts_with(" ▚ tmt  ‹ "),
+            line.starts_with(" ▚ tmt  │ ‹ "),
             "the pin stays first: {line:?}"
         );
         assert!(

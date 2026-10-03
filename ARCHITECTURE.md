@@ -3674,7 +3674,7 @@ format-preserving replacement that records `me`. A tab line that doesn't
 fit scrolls: `board::view::tab_line` owns grouping, window selection, rendered
 cell widths and tab hit geometry together. After `tabs::arrange`, it groups only
 adjacent squad keys sharing a nonempty prefix before the first `-`, with two or
-more drawn tabs; aggregate keys interrupt a group. Prefix spans have no hit;
+more drawn tabs; aggregate keys interrupt a group. Prefix and separator spans have no hit;
 each suffix retains its own fixed mark slot and original key/index for clicks,
 drags and switching. An isolated drawn group member retains its full name.
 Left overflow counts skipped tabs; right overflow names remaining tabs, ordered
