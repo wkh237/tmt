@@ -1110,7 +1110,7 @@ capacity limit returns the existing core error before the role pairs or join,
 rather than silently changing leadership. Reads never convert state.
 
 The package exposes a Squad-owned `cron` library. `cron_command` composes the
-management grammar/output through one `cron_service` shared with future clock and
+management grammar/output through one `cron_service` shared with clock and
 board callers. `cron::schedule` owns positive elapsed intervals, fixed
 local times and five-field cron parsing/next-slot math. Named time zones use
 Jiff's system/zoneinfo database without a bundled database. Fixed local times
@@ -1144,8 +1144,8 @@ bounded process owner with an explicit identity or anonymous envelope.
 
 Owner hook registration (`identityHooks`, consumer `squad-cron`) precedes job
 publication; a failed publication can leave a harmless unused reference. List,
-show and apply process one pending retirement page of at most 16 hooks. Future
-clock ticks call that same drain. A still-matching room/job/owner reference becomes
+show and apply process one pending retirement page of at most 16 hooks. Clock
+ticks call that same drain. A still-matching room/job/owner reference becomes
 paused/no owner with a new revision before hook acknowledgment; obsolete hooks
 are acknowledged without editing a reassigned or removed job. Add/edit/pause/
 resume/remove notify the owner; reassign notifies old/new owners, with the message
@@ -1155,7 +1155,31 @@ room/job/revision/action/recipient operation UUIDs. Failures are returned as
 warnings, without rollback, outbox or recovery journal. Interruption can lose a
 notice. Reassignment retains a pause; resume requires a current owner. Read
 projections exclude jobs belonging to retired/replaced rooms while preserving
-their records and counters. No clock commands or board integration ship here.
+their records and counters.
+
+`cron::clock` owns the bounded, read-only Running/NoClock/Unknown lease projection
+and atomic `clock.json` publication under the same extension directory. A stable,
+nonblocking `clock.lock` serializes acquisition, renewal and ownership-checked
+release. Pane, PID, start and expiry are evidence, not process probes; an expired
+lease can be taken over. `cron::tick` owns slot selection and deterministic
+operation UUIDs from room UUID, non-reused c-id and UTC slot milliseconds. A
+running clock admits every slot since its own previous tick, capped at five
+minutes; startup, takeover, restart and clock rollback baseline at now. A
+standalone tick admits the last 60 seconds. No absent-clock history is replayed.
+
+`cron_clock` adapts `run/tick/clock/send` to public core commands/API and the shared
+admission service. Each scheduled send revalidates revision, room and owner,
+renews its lease, then dispatches the exact message anonymously outside the jobs
+lock. An uncertain create recovers the same operation with `dispatch.show`; it
+never invents a replacement or re-wakes a replay. Manual send retains an explicit
+CronActor and viewed revision, with a new operation ID per action; paused jobs
+with a current owner may be sent without changing their schedule. Acceptance is
+reported separately from delivery and results are not tracked. `board/mod.rs`
+starts and stops an independent cancellable, joined clock worker; refresh-off,
+repaint, tabs and usage generations do not own its lifetime. Foreground run
+handles interrupt/termination/hangup through that same shutdown owner, cancelling
+owned core children before releasing the lease. A second foreground run or tick
+refuses an unexpired holder; a board waits and can take over after expiry.
 
 `ls` (alias `status`) joins
 one `rooms.roster` snapshot with `ls --room` presence. Presence is read first so
