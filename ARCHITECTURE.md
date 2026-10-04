@@ -1268,10 +1268,15 @@ pruned against visible/hidden tabs, and owns the runtime selected window. Leavin
 a tab closes sampling continuity. Meter state is separate from pane/fold settings.
 
 `board::rate` validates cumulative input/output/cache-subset, session/driver/epoch
-and sequence/time order. Each reporting UUID owns a bounded ring of 5 s
-receipt-time buckets, sized by the longest configured observation window (at most
-24 h). Aggregate totals and trend slices derive from those same member rings,
-without a second counter tracker. Missing, invalid, gap, decrease, new-session or
+and sequence/time order. On tab entry the worker batches public
+`consumption.history` reads for the longest configured window, capped at the API's
+1 h limit. Its closed deltas seed the existing per-UUID rings; the included
+`latest` watermark starts live counter subtraction. Re-entry replaces that recent
+range while preserving older board observations, without recounting overlapping
+windows or prorating rollups. Each reporting UUID owns a bounded ring of 5 s
+buckets, sized by the longest configured observation window (at most 24 h).
+Receipt time advances monotonically from a UTC anchor. Aggregate totals and trend
+slices derive from those same member rings, without a second counter tracker. Missing, invalid, gap, decrease, new-session or
 recovery evidence establishes a baseline without invented tokens. Removing a
 roster UUID drops its history. Failed reads close continuity and mark gaps after
 two sampling periods. Provider observedAt is order evidence, not a heartbeat.

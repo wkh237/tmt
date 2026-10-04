@@ -142,6 +142,7 @@ fn excluded_help_uses_roster_names_for_members_absent_from_displayed_rows() {
     roster.names.insert(lead.into(), "design-lead".into());
     roster.resumes.insert(lead.into(), Value::Null);
     app.view.as_mut().unwrap().token_rate = Some(crate::board::app::RateView {
+        history: None,
         settings: crate::config::TokenRate {
             enabled: true,
             ..Default::default()
@@ -321,6 +322,7 @@ fn window_hint_is_conditional_whole_and_help_discloses_semantics() {
         );
     }
     app.view.as_mut().unwrap().token_rate = Some(crate::board::app::RateView {
+        history: None,
         settings: app.meter.as_ref().unwrap().settings,
         input: input(100),
     });
@@ -343,6 +345,7 @@ fn help_roster_and_disabled_custom_w_do_not_change_on_meter_only_ticks() {
     let mut app = with_meter(now, true);
     app.help = true;
     app.view.as_mut().unwrap().token_rate = Some(crate::board::app::RateView {
+        history: None,
         settings: app.meter.as_ref().unwrap().settings,
         input: input(100),
     });

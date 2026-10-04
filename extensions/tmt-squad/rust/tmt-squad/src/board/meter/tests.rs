@@ -124,3 +124,30 @@ fn returning_tab_expires_short_window_and_retains_long_gap_history() {
         "cached tab cannot bridge its unobserved interval"
     );
 }
+
+#[test]
+fn history_opens_immediately_and_home_live_extension_matches_named_totals() {
+    use super::super::rate::tests::{fixture_seeds, historical_input, history_fixture};
+    let fixture = history_fixture();
+    let seeds = fixture_seeds(&fixture);
+    let input = historical_input(&fixture, true);
+    let now = Instant::now();
+    let mut named = Meter::new(TokenRate::default(), &input, now);
+    named.origin_ms = 22_500;
+    named.seed(&input, &seeds, now, true);
+    assert_eq!(named.digits().as_deref(), Some("~30"));
+    assert!(named.animation.is_none());
+    let template = input.joined(&std::collections::BTreeMap::new());
+    let mut home = Meter::new(TokenRate::default(), &template, now);
+    home.origin_ms = 22_500;
+    home.seed(&template, &seeds, now, false);
+    assert_eq!(home.total(2, now).unwrap().tokens, 21);
+    home.sample(Ok(&input), now + Duration::from_secs(5));
+    assert_eq!(
+        home.total(2, now + Duration::from_secs(5)).unwrap().tokens,
+        named.total(2, now).unwrap().tokens
+    );
+    named.select(TokenWindow::FIVE_MINUTES, now);
+    assert_eq!(named.label().as_deref(), Some("5m"));
+    assert_eq!(named.digits().as_deref(), Some("~30"));
+}
